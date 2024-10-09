@@ -13,7 +13,7 @@
           buildCommand = "${old.buildCommand}\n patchShebangs $out";
         });
       in rec {
-        defaultPackage = packages.my-script;
+        packages.default = packages.my-script;
         packages.my-script = pkgs.symlinkJoin {
           name = my-name;
           version = "0.01";
