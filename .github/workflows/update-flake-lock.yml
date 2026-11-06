@@ -1,0 +1,27 @@
+name: update flake.lock
+
+# Weekly: update flake.lock, run all checks, push only if they pass.
+# If the checks fail, nothing is pushed and GitHub emails you about the failed run.
+on:
+  schedule:
+    - cron: "0 4 * * 1" # Mondays 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - run: nix flake update
+      - run: nix flake check -L
+      - name: commit and push
+        run: |
+          git diff --quiet flake.lock && { echo "flake.lock unchanged"; exit 0; }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git commit -am "flake.lock: update"
+          git push
