@@ -17,11 +17,13 @@ Two reminders for a flake-based NixOS:
 
 ```nix
 # flake.nix
-inputs.versionwidget.url = "github:samularity/nixos-versioncheck";
-inputs.versionwidget.inputs.nixpkgs.follows = "nixpkgs";
+inputs.nixos-update-check.url = "github:samularity/nixos-versioncheck";
+inputs.nixos-update-check.inputs.nixpkgs.follows = "nixpkgs";
+
+outputs = { self, nixpkgs, nixos-update-check, ... }:
 # ...
 modules = [
-  versionwidget.nixosModules.default
+  nixos-update-check.nixosModules.default
   { services.nixos-update-check.enable = true; }
 ];
 ```
