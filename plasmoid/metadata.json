@@ -1,0 +1,17 @@
+{
+    "KPlugin": {
+        "Authors": [{ "Name": "samularity" }],
+        "Category": "System Information",
+        "EnabledByDefault": true,
+        "Description": "Shows how old your NixOS flake.lock is and whether a new NixOS release is out",
+        "Icon": "nix-snowflake",
+        "Id": "org.samularity.nixosupdate",
+        "License": "MIT",
+        "Name": "NixOS Update Status",
+        "Version": "1.0"
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "SystemServices"
+}

@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# nixos-update-check — keep an eye on two things:
+#   1. a new NixOS release (e.g. 26.11) has been published   -> desktop notification, max once a day
+#   2. the nixpkgs input in flake.lock is older than N days  -> shown by the Plasma tray widget
+#
+# Usage:
+#   nixos-update-check status              print JSON for the tray widget (offline, cheap)
+#   nixos-update-check release [--notify] [--force]
+#                                          query nixpkgs/channels.nixos.org for the newest release,
+#                                          cache the result; --notify sends a notification if an
+#                                          upgrade is available (at most once per day),
+#                                          --force ignores the 12h network cache
+#   nixos-update-check test-notify         send a test notification
+#
+# Configuration (environment):
+#   NIXOS_UPDATE_FLAKE         flake directory               (default: /etc/nixos)
+#   NIXOS_UPDATE_INPUT         flake input to inspect        (default: nixpkgs)
+#   NIXOS_UPDATE_MAX_AGE_DAYS  lock considered stale after   (default: 7)
+set -euo pipefail
+
+FLAKE="${NIXOS_UPDATE_FLAKE:-/etc/nixos}"
+INPUT="${NIXOS_UPDATE_INPUT:-nixpkgs}"
+MAX_AGE_DAYS="${NIXOS_UPDATE_MAX_AGE_DAYS:-7}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/nixos-update-check"
+RELEASE_CACHE="$STATE_DIR/release.json"
+CACHE_MAX_AGE=$((12 * 3600))
+
+mkdir -p "$STATE_DIR"
+
+# ---------------------------------------------------------------- flake.lock
+
+# JSON: {ref, rev, lastModified} of the root input $INPUT, or null
+lock_info() {
+  local lock="$FLAKE/flake.lock"
+  [[ -r "$lock" ]] || { echo null; return; }
+  jq -c --arg in "$INPUT" '
+    (.nodes[.root].inputs[$in]) as $n
+    | if ($n | type) == "string" then
+        .nodes[$n] | {ref: (.original.ref // null), rev: (.locked.rev // null),
+                      lastModified: (.locked.lastModified // null)}
+      else null end' "$lock"
+}
+
+# "26.05" if the input tracks nixos-26.05 (or nixos-26.05-small), else "" (unstable, master, ...)
+track_of_ref() {
+  sed -nE 's/^nixos-([0-9]{2}\.[0-9]{2})(-small)?$/\1/p' <<<"${1:-}"
+}
+
+# ---------------------------------------------------------------- releases
+
+# Newest *released* NixOS version. A nixos-YY.MM branch appears at branch-off,
+# weeks before the release; during that time channels.nixos.org/nixos-YY.MM
+# either 404s or redirects to ".../nixos-YY.MMbetaNNN...". Only a redirect to
+# ".../nixos-YY.MM.NNNN.<rev>" counts as released.
+latest_release() {
+  local versions v url
+  versions=$(git ls-remote --heads https://github.com/NixOS/nixpkgs 'refs/heads/nixos-*' |
+    sed -nE 's#.*refs/heads/nixos-([0-9]{2}\.[0-9]{2})$#\1#p' | sort -Vr | head -n 3)
+  [[ -n "$versions" ]] || return 1
+  for v in $versions; do
+    url=$(curl -fsSL --max-time 30 -o /dev/null -w '%{url_effective}' \
+      "https://channels.nixos.org/nixos-$v") || continue
+    if [[ "$url" =~ /nixos-${v//./\\.}\.[0-9]+\.[0-9a-f]+$ ]]; then
+      echo "$v"
+      return 0
+    fi
+  done
+  return 1
+}
+
+version_gt() { [[ "$1" != "$2" && "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]; }
+
+notify() {
+  notify-send --app-name="NixOS" --icon=nix-snowflake --urgency="$1" "$2" "$3" || true
+}
+
+cmd_release() {
+  local do_notify=0 force=0
+  for a in "$@"; do
+    case "$a" in
+      --notify) do_notify=1 ;;
+      --force) force=1 ;;
+      *) echo "unknown option $a" >&2; exit 2 ;;
+    esac
+  done
+
+  local now latest checked_at
+  now=$(date +%s)
+  checked_at=$(jq -r '.checkedAt // 0' "$RELEASE_CACHE" 2>/dev/null || echo 0)
+
+  if (( force == 0 && now - checked_at < CACHE_MAX_AGE )); then
+    latest=$(jq -r '.latest' "$RELEASE_CACHE")
+  else
+    if ! latest=$(latest_release); then
+      echo "could not determine latest NixOS release (offline?)" >&2
+      # keep previous result, remember the error for the widget
+      jq -n --slurpfile old <(cat "$RELEASE_CACHE" 2>/dev/null || echo '{}') --argjson t "$now" \
+        '($old[0] // {}) + {error: "offline or lookup failed", errorAt: $t}' >"$RELEASE_CACHE.tmp" &&
+        mv "$RELEASE_CACHE.tmp" "$RELEASE_CACHE"
+      exit 1
+    fi
+    jq -n --arg l "$latest" --argjson t "$now" '{latest: $l, checkedAt: $t, error: null}' \
+      >"$RELEASE_CACHE.tmp" && mv "$RELEASE_CACHE.tmp" "$RELEASE_CACHE"
+  fi
+
+  local ref current
+  ref=$(lock_info | jq -r '.ref // empty')
+  current=$(track_of_ref "$ref")
+
+  if [[ -n "$current" ]]; then
+    if version_gt "$latest" "$current"; then
+      echo "upgrade available: $current -> $latest"
+      if (( do_notify )) && [[ "$(cat "$STATE_DIR/notified-day" 2>/dev/null)" != "$(date +%F)" ]]; then
+        notify critical "NixOS $latest is released" \
+          "You are still on $current.\nIn $FLAKE/flake.nix change nixos-$current → nixos-$latest, then nix flake update and nixos-rebuild switch.\nRelease notes: https://nixos.org/manual/nixos/stable/release-notes"
+        date +%F >"$STATE_DIR/notified-day"
+      fi
+    else
+      echo "up to date: $current is the latest release"
+    fi
+  else
+    # tracking unstable/master: there is nothing to migrate to, tell once per release
+    echo "tracking ${ref:-unknown}; latest release is $latest"
+    if (( do_notify )) && [[ "$(cat "$STATE_DIR/notified-release" 2>/dev/null)" != "$latest" ]]; then
+      if [[ -f "$STATE_DIR/notified-release" ]]; then
+        notify normal "NixOS $latest is released" \
+          "Your flake tracks ${ref:-an unknown branch}. Switch to nixos-$latest if you want to be on stable."
+      fi
+      # first run only records the current release, so we don't announce an old one
+      echo "$latest" >"$STATE_DIR/notified-release"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------- status JSON
+
+cmd_status() {
+  local lock running
+  lock=$(lock_info)
+  running=$(cat /run/current-system/nixos-version 2>/dev/null || true)
+  jq -n \
+    --arg flake "$FLAKE" --arg input "$INPUT" --argjson maxAge "$MAX_AGE_DAYS" \
+    --argjson lock "$lock" --arg running "$running" \
+    --slurpfile rel <(cat "$RELEASE_CACHE" 2>/dev/null || echo null) '
+    def track: (. // "") | capture("^nixos-(?<v>[0-9]{2}\\.[0-9]{2})(-small)?$").v // null;
+    ($rel[0]) as $r
+    | ($lock.ref | track) as $current
+    | (if $lock.lastModified then ((now - $lock.lastModified) / 86400 | floor) else null end) as $age
+    | {
+        flake: $flake,
+        input: $input,
+        maxAgeDays: $maxAge,
+        lock: $lock,
+        ageDays: $age,
+        lockStale: ($age != null and $age >= $maxAge),
+        running: $running,
+        # running version ends in .<shortrev>; differs from the lock -> rebuild pending
+        rebuildPending: ($lock.rev != null and $running != ""
+                         and (($lock.rev[0:7]) as $s | ($running | endswith($s)) | not)),
+        current: $current,
+        latest: ($r.latest // null),
+        releaseCheckedAt: ($r.checkedAt // null),
+        releaseError: ($r.error // null),
+        upgradeAvailable: ($current != null and $r.latest != null
+                           and ([$r.latest, $current] | map(split(".") | map(tonumber)) | .[0] > .[1]))
+      }'
+}
+
+case "${1:-status}" in
+  status) cmd_status ;;
+  release) shift; cmd_release "$@" ;;
+  test-notify) notify normal "nixos-update-check" "Notifications work." ;;
+  -h | --help | help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "unknown command: $1 (try --help)" >&2; exit 2 ;;
+esac
